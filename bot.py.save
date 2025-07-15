@@ -1,0 +1,106 @@
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.utils import executor
+import aiosqlite
+
+API_TOKEN = '8197209578:AAH4ypgRz9Butww_HxDTBeXJCgTzHQO1D_E'
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot, storage=MemoryStorage())
+
+# Кнопки
+kb = ReplyKeyboardMarkup(resize_keyboard=True)
+kb.add(KeyboardButton("Новая смена"), KeyboardButton("Отчёт"), KeyboardButton("Возврат"))
+
+class Form(StatesGroup):
+    waiting_for_return = State()
+
+# Создание базы
+async def create_db():
+    async with aiosqlite.connect("data.db") as db:
+        await db.execute('''
+        CREATE TABLE IF NOT EXISTS shifts (
+            chat_id INTEGER,
+            user_id INTEGER,
+            amount REAL DEFAULT 0,
+            PRIMARY KEY (chat_id, user_id)
+        )
+        ''')
+        await db.commit()
+
+@dp.message_handler(commands=['start'])
+async def start_cmd(message: types.Message):
+    await message.reply(
+        "Привет, я Интерактивный Александр Васильевич первой версии. Тут мы будем считать переводы. Жми кнопки!",
+        reply_markup=kb
+    )
+
+@dp.message_handler(lambda msg: msg.text == "Новая смена")
+async def new_shift(message: types.Message):
+    async with aiosqlite.connect("data.db") as db:
+        await db.execute(
+            "DELETE FROM shifts WHERE chat_id = ? AND user_id = ?",
+            (message.chat.id, message.from_user.id)
+        )
+        await db.execute(
+            "INSERT INTO shifts (chat_id, user_id, amount) VALUES (?, ?, ?)",
+            (message.chat.id, message.from_user.id, 0)
+        )
+        await db.commit()
+    await message.reply("Смену открыл? Значит лавэшка уже капнула :)")
+
+@dp.message_handler(lambda msg: msg.text == "Отчёт")
+async def report(message: types.Message):
+    async with aiosqlite.connect("data.db") as db:
+        async with db.execute(
+            "SELECT amount FROM shifts WHERE chat_id = ? AND user_id = ?",
+            (message.chat.id, message.from_user.id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            total = row[0] if row else 0
+            await message.reply(f"Что-то сегодня вообще плохо, всего: {total:.2f} ₽")
+
+@dp.message_handler(lambda msg: msg.text == "Возврат")
+async def return_start(message: types.Message):
+    await message.reply("Я сразу знал, что вернут! Введи сумму возврата:")
+    await Form.waiting_for_return.set()
+
+@dp.message_handler(state=Form.waiting_for_return)
+async def handle_return(message: types.Message, state: FSMContext):
+    try:
+        value = float(message.text.replace(',', '.'))
+        async with aiosqlite.connect("data.db") as db:
+            await db.execute(
+                "UPDATE shifts SET amount = amount - ? WHERE chat_id = ? AND user_id = ?",
+                (value, message.chat.id, message.from_user.id)
+            )
+            await db.commit()
+        await message.reply(f"Жалко конечно, но эти {value:.2f} учтены.")
+    except ValueError:
+        await message.reply("Ты че вообще пишешь? Введи число!")
+    await state.finish()
+
+@dp.message_handler()
+async def handle_amount(message: types.Message):
+    try:
+        value = float(message.text.replace(',', '.'))
+        async with aiosqlite.connect("data.db") as db:
+            await db.execute(
+                "INSERT INTO shifts (chat_id, user_id, amount) VALUES (?, ?, ?) "
+                "ON CONFLICT(chat_id, user_id) DO UPDATE SET amount = amount + ?",
+                (message.chat.id, message.from_user.id, value, value)
+            )
+            await db.commit()
+        await message.reply(f"И это всё? Хорошо, учту эти: {value:.2f} ₽")
+    except ValueError:
+        await message.reply("Это че за сумма? Введи число, например: 250.50")
+
+if __name__ == '__main__':
+    import asyncio
+    asyncio.run(create_db())
